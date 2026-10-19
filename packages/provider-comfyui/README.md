@@ -24,6 +24,7 @@ Ports map onto workflow inputs as follows. Anything without a slot keeps the tem
 | `images[0]` | `nodes.image` | uploaded via `POST /upload/image` into a LoadImage node |
 | `firstFrame` / `lastFrame` (video) | `nodes.firstFrame` / `nodes.lastFrame` | same upload path |
 | `watermark`, `extendedReasoning` | — | no ComfyUI equivalent; `true` is refused |
+| `image-set` | — | renders one storyline across pictures; `count` fans out independent seeds, so `true` is refused |
 
 ## Configure a video project
 

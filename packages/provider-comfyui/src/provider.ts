@@ -171,6 +171,9 @@ function rejection(route: Omit<ComfyUiRoute, "supports">, request: GenerationReq
     if (scalar(request, "extendedReasoning") === true) {
       return `ComfyUI has no extended-reasoning mode for ${name}`;
     }
+    if (scalar(request, "imageSet") === true) {
+      return `An image set renders one storyline across its pictures; ${name} fans count out to independent seeds`;
+    }
     if (itemCount(request, "images") > 0 && spec.nodes.image === undefined) {
       return `This ComfyUI image workflow takes no reference images; configure an image node for ${name}`;
     }

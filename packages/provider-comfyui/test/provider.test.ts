@@ -128,6 +128,16 @@ test("watermark and unconfigured video workflows are refused before submission",
   assert.match(verdict.status === "unsupported" ? verdict.reason : "", /no workflow configured/);
 });
 
+test("image-set is refused rather than degraded to independent seeds", () => {
+  const imageRoute = route("@hypit/wan", "wan-2.7-image");
+  const verdict = imageRoute.supports({
+    capability: imageRoute.capability, returns: imageRoute.returns,
+    constraints: constraints(sealWanRequest("wan-2.7-image", { prompt: ["cat"], imageSet: [true], count: [6] })),
+  });
+  assert.equal(verdict.status, "unsupported");
+  assert.match(verdict.status === "unsupported" ? verdict.reason : "", /storyline/);
+});
+
 test("an image request runs the built-in template through submit, poll and collect", async () => {
   const fake = fakeComfyUi({ output: { key: "images", filename: "hypit_00001_.png" } });
   const endpoint = registeredEndpoint({ ...imageInstance, fetch: fake.fetcher }, "wan-2.7-image");
