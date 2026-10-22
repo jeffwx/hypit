@@ -22,6 +22,13 @@ test("seconds beyond the model's ceiling are rejected at seal time", () => {
   assert.throws(() => sealWanVideoRequest("wan-2.2-video", { prompt: ["run"], resolution: ["4K"] }));
 });
 
+test("resolution and aspect-ratio must be stated together", () => {
+  assert.throws(() => sealWanVideoRequest("wan-2.2-video", { prompt: ["run"], aspectRatio: ["16:9"] }),
+    /aspectRatio also requires resolution/);
+  assert.throws(() => sealWanVideoRequest("wan-2.2-video", { prompt: ["run"], resolution: ["480p"] }),
+    /resolution also requires aspectRatio/);
+});
+
 test("module identity matches what the ComfyUI Provider maps", () => {
   assert.equal(wanVideoModuleRef.name, "@local/wan-video");
   assert.deepEqual([...wanVideoModels], ["wan-2.2-video"]);

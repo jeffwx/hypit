@@ -86,7 +86,12 @@ function decoder(endpoint: ExactModelEndpoint): StructuredSurfaceHandler {
       assert(tag in keyframePorts, `${element.name} accepts only FirstFrame and LastFrame children`);
       exact(child, ["image"], ["image"]);
       assert(!child.children.some((item) => item.kind === "element" || item.value.trim()), `${child.name} must be empty`);
-      keyframes.push({ tag, image: ref(child, "image", blobTypes.blob, resolveReference) });
+      const image = ref(child, "image", blobTypes.blob, resolveReference);
+      if (image.record !== undefined) {
+        assert(image.record.value.kind === "blob" && image.record.value.mediaType.startsWith("image/"),
+          `${child.name}.image must reference an image Artifact`);
+      }
+      keyframes.push({ tag, image });
     }
     for (const tag of Object.keys(keyframePorts) as KeyframeTag[]) {
       assert(keyframes.filter((keyframe) => keyframe.tag === tag).length <= 1, `${element.name} accepts at most one ${tag}`);

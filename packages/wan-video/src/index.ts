@@ -31,7 +31,10 @@ function wanVideoPortTable(model: WanVideoModel): GenerationPortTable {
       { name: "aspectRatio", value: { kind: "enum", values: [...WAN_VIDEO_ASPECTS] }, minItems: 0, maxItems: 1 },
       { name: "seed", value: { kind: "number", integer: true, minimum: 0, maximum: 2_147_483_647 }, minItems: 0, maxItems: 1 },
     ],
-    requires: [],
+    requires: [
+      { kind: "requiresPresent", port: "aspectRatio", needs: ["resolution"] },
+      { kind: "requiresPresent", port: "resolution", needs: ["aspectRatio"] },
+    ],
   });
 }
 
@@ -67,7 +70,7 @@ const attributes: readonly SurfaceAttributeVocabulary[] = [
   { name: "seconds", kind: "literal", required: false,
     summary: "Target duration in whole seconds; the serving workflow's fps sets the frame count." },
   { name: "resolution", kind: "literal", required: false, values: [...WAN_VIDEO_RESOLUTIONS],
-    summary: "The resolution band the shot renders at." },
+    summary: "The resolution band the shot renders at; state it together with aspect-ratio." },
   { name: "aspect-ratio", kind: "literal", required: false, values: [...WAN_VIDEO_ASPECTS],
     summary: "Frame aspect; state it together with resolution." },
   { name: "seed", kind: "literal", required: false,
@@ -93,7 +96,11 @@ export const wanVideoMarkupSurfaces = [{
   name: "video",
   tag: "Video",
   mode: "structured" as const,
-  outputs: [wanVideoEndpoints.video!.draftType, wanVideoEndpoints.video!.mediaBindings.firstFrame!.type],
+  outputs: [
+    wanVideoEndpoints.video!.draftType,
+    wanVideoEndpoints.video!.mediaBindings.firstFrame!.type,
+    wanVideoEndpoints.video!.mediaBindings.lastFrame!.type,
+  ],
   vocabulary: {
     summary: "Generates one video shot with a self-hosted Wan-style model from a Text prompt and optional first/last keyframes.",
     attributes,
