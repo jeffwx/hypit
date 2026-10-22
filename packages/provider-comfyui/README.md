@@ -19,8 +19,8 @@ Ports map onto workflow inputs as follows. Anything without a slot keeps the tem
 | `prompt` | `nodes.prompt` | required in every node map |
 | `seed` | `nodes.seed` | required; `count` fans out to consecutive seeds |
 | `resolution` (image) | `width` + `height` | 1K→1024², 2K→1536², 4K→2048² |
-| `resolution`+`aspectRatio` (video) | `width` + `height` | Wan pairs, e.g. 480p 16:9 → 832×480 |
-| `seconds` (video) | `nodes.frames` | `seconds × fps` (default fps 16) |
+| `resolution`+`aspectRatio` (video) | `width` + `height` | Wan pairs, e.g. 480p 16:9 → 832×480; state both together (the wan-video package enforces it) |
+| `seconds` (video) | `nodes.frames` | `seconds × fps` rounded up onto the Wan 4n+1 frame grid (default fps 16; 5s @ 16fps → 81) |
 | `images[0]` | `nodes.image` | uploaded via `POST /upload/image` into a LoadImage node |
 | `firstFrame` / `lastFrame` (video) | `nodes.firstFrame` / `nodes.lastFrame` | same upload path |
 | `watermark`, `extendedReasoning` | — | no ComfyUI equivalent; `true` is refused |
@@ -61,7 +61,7 @@ The Provider is an ordinary project package: copy or link `packages/provider-com
 }
 ```
 
-Config keys: `baseUrl` (HTTPS, loopback HTTP, or plain HTTP with `allowHttp: true`), `defaultConcurrency`, `actionLimits`, `pollIntervalMs`, `requestTimeoutMs`, `operationTimeoutMs`, `workflows`. Relative `template` paths resolve against the directory you run `hypit` from. A working example lives at `E:\code\comfyui-demo`.
+Config keys: `baseUrl` (HTTPS, loopback HTTP, or plain HTTP with `allowHttp: true`), `defaultConcurrency`, `actionLimits`, `pollIntervalMs`, `requestTimeoutMs`, `operationTimeoutMs`, `workflows`. Relative `template` paths resolve against the directory you run `hypit` from. Unknown keys inside a workflow entry (or its `nodes` map) are rejected at activation, so a mistyped `fps` or `heigth` fails configuration instead of rendering wrong output.
 
 ## Prepare a workflow template
 
@@ -87,4 +87,4 @@ Expose the instance through its custom-service proxy and point `baseUrl` at the 
 
 - Image pipeline verified end to end against a local ComfyUI 0.28 running Qwen Image (fp8) — build, poll, collect, export.
 - Video pipeline verified end to end against a YZ MiniMax-H3 portable ComfyUI: `MiniMaxH3Director` t2v (int8 UNET + qwen3vl CLIP + dual VAE) through `CreateVideo`/`SaveVideo`, exported as MP4 (~2s, 864-class 480p, ~15 min on an 8 GB GPU). The H3 workflow needs ComfyUI core with official H3 support (CLIPLoader `type: "minimax"`); a desktop 0.28 install without it rejects the type at validation.
-- Slot maps for both live workflows live in the demo project `E:\code\comfyui-demo` (`workflows/txt2img.json`, `workflows/h3-t2v-8190.json`, plus the dual-endpoint `hypit.runtime.json` with a Profile binding routing video to the H3 instance).
+- The bundled default template is a starting point, not a working pipeline: its CheckpointLoader names the placeholder `model.safetensors`, so point `workflows["wan-2.7-image"]` at your own exported workflow (or a copy of `workflows/default-image.json` with your checkpoint name) before rendering. The live slot maps used during verification were plain project files in the author's video project (`workflows/txt2img.json`, `workflows/h3-t2v-8190.json`, and a dual-endpoint `hypit.runtime.json` whose bindings routed video to the H3 instance) — reproduce them with the export steps above rather than relying on a path outside this repository.

@@ -12,14 +12,18 @@ import type { CanonicalValue } from "@hypit/protocol";
 import { createComfyUiProvider } from "./provider.js";
 import type { ComfyUiNodeMap, ComfyUiWorkflowSpec } from "./workflow.js";
 
-const NODE_SLOTS = ["prompt", "negative", "seed", "width", "height", "image", "firstFrame", "lastFrame", "frames"] as const;
+const NODE_SLOTS = ["prompt", "seed", "width", "height", "image", "firstFrame", "lastFrame", "frames"] as const;
 
 function workflowSpec(value: CanonicalValue, name: string): ComfyUiWorkflowSpec {
   const spec = runtimeConfigObject(value, `ComfyUI workflows["${name}"]`);
+  runtimeConfigExact(spec, ["template", "nodes", "fps"], `ComfyUI workflows["${name}"]`);
   const template = runtimeConfigString(spec.template, `ComfyUI workflows["${name}"].template`);
   if (template === undefined) throw new Error(`ComfyUI workflows["${name}"].template (path to a workflow_api.json) is required`);
   if (spec.nodes === undefined) throw new Error(`ComfyUI workflows["${name}"].nodes is required`);
   const nodesValue = runtimeConfigObject(spec.nodes, `ComfyUI workflows["${name}"].nodes`);
+  // Reject unknown slot keys: a mistyped "fps" or "heigth" silently ignored here would render
+  // wrong output instead of failing configuration.
+  runtimeConfigExact(nodesValue, [...NODE_SLOTS], `ComfyUI workflows["${name}"].nodes`);
   const nodes: Record<string, string> = {};
   for (const slot of NODE_SLOTS) {
     const ref = runtimeConfigString(nodesValue[slot], `ComfyUI workflows["${name}"].nodes.${slot}`);

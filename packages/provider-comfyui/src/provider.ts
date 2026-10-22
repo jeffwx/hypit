@@ -17,12 +17,13 @@ import type { ComfyUiNodeMap, ComfyUiWorkflowSpec, WorkflowGraph } from "./workf
 export const comfyUiProviderModuleRef = { name: "@local/provider-comfyui", version: "1" } as const;
 
 /**
- * The bundled image template uses only core ComfyUI nodes, so a stock install can serve the image
- * capabilities before any workflow is configured. Its checkpoint name still has to match a model
- * the instance actually has; the README shows where to change it.
+ * The bundled image template uses only core ComfyUI nodes, so a stock install can serve
+ * wan-2.7-image before any workflow is configured; its checkpoint name still has to match a model
+ * the instance actually has (the README explains how to replace it). The Pro variant deliberately
+ * has no bundled default: it is refused until the Profile configures a workflow for it.
  */
 const builtinImageNodes: ComfyUiNodeMap = {
-  prompt: "6.text", negative: "7.text", seed: "3.seed", width: "5.width", height: "5.height",
+  prompt: "6.text", seed: "3.seed", width: "5.width", height: "5.height",
 };
 const builtinImageSpec: ComfyUiWorkflowSpec = {
   template: fileURLToPath(new URL("../workflows/default-image.json", import.meta.url)),
@@ -117,9 +118,11 @@ class ComfyUiClient {
       const response = await wait(this.fetcher(`${this.baseUrl}/upload/image`, { method: "POST", body: form, signal }));
       const body = await wait(response.text());
       if (!response.ok) throw new ComfyUiHttpError(response.status, response, body, { method: "POST", path: "/upload/image" });
-      const uploaded = object(JSON.parse(body), "ComfyUI upload response");
-      const name = text(uploaded.name, "ComfyUI upload name");
-      const subfolder = typeof uploaded.subfolder === "string" ? uploaded.subfolder : "";
+      let uploaded: unknown;
+      try { uploaded = JSON.parse(body); } catch { throw new EndpointResponseError("ComfyUI returned invalid JSON from /upload/image"); }
+      const record = object(uploaded, "ComfyUI upload response");
+      const name = text(record.name, "ComfyUI upload name");
+      const subfolder = typeof record.subfolder === "string" ? record.subfolder : "";
       return subfolder.length === 0 ? name : `${subfolder}/${name}`;
     }, () => new EndpointTransportError("ComfyUI image upload timed out", { timeout: true }));
   }
@@ -136,6 +139,26 @@ class ComfyUiClient {
       const mediaType = declared ?? response.headers.get("content-type")?.split(";", 1)[0]?.trim() ?? "application/octet-stream";
       return { bytes, mediaType };
     }, () => new EndpointTransportError("ComfyUI download timed out", { timeout: true }));
+  }
+
+  /** The prompt ids currently queued or executing, from GET /queue. History is process memory only, so this is the other half of "still alive". */
+  async queuePromptIds(): Promise<ReadonlySet<string>> {
+    const queue = await this.json("/queue");
+    const ids = new Set<string>();
+    for (const key of ["queue_running", "queue_pending"]) {
+      const list = queue[key];
+      if (!Array.isArray(list)) continue;
+      for (const item of list) if (Array.isArray(item) && typeof item[1] === "string") ids.add(item[1]);
+    }
+    return ids;
+  }
+
+  /** Best-effort removal of queued prompts, used when a later submission fails. */
+  async deleteQueue(promptIds: readonly string[]): Promise<void> {
+    await this.json("/queue", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ delete: [...promptIds] }),
+    });
   }
 }
 
@@ -211,7 +234,8 @@ export function createComfyUiRoutes(workflows: Readonly<Record<string, ComfyUiWo
       ...mapping,
       key: capabilityKey(mapping.capability),
       returns: mapping.result === "image" ? generationTypes.imageSet : generationTypes.videoSet,
-      spec: () => workflows[mapping.capability.name] ?? (mapping.result === "image" ? builtinImageSpec : undefined),
+      spec: () => workflows[mapping.capability.name]
+        ?? (mapping.capability.name === "wan-2.7-image" ? builtinImageSpec : undefined),
     };
     const supports = (request: EndpointRequest): EndpointSupport => {
       const reason = rejection(base, request.constraints as unknown as GenerationRequest);
@@ -306,16 +330,24 @@ function endpoint(client: ComfyUiClient, routes: readonly ComfyUiRoute[], pollIn
         })).input as Record<string, unknown>;
         const prepared = buildGraphs(route, spec, template, input);
         const promptIds: string[] = [];
-        for (const graph of prepared.graphs) {
-          await context.reportProgress?.({ phase: promptIds.length === 0 ? "Submitting ComfyUI prompt" : `Submitting ComfyUI prompt ${promptIds.length + 1}` });
-          const response = await client.json("/prompt", {
-            method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ prompt: graph, client_id: context.operation }),
-          });
-          const id = text(response.prompt_id, "ComfyUI prompt_id");
-          const errors = object(response.node_errors ?? {}, "ComfyUI node_errors");
-          assert(Object.keys(errors).length === 0, `ComfyUI rejected workflow nodes: ${Object.keys(errors).join(", ")}`);
-          promptIds.push(id);
+        try {
+          for (const graph of prepared.graphs) {
+            await context.reportProgress?.({ phase: promptIds.length === 0 ? "Submitting ComfyUI prompt" : `Submitting ComfyUI prompt ${promptIds.length + 1}` });
+            const response = await client.json("/prompt", {
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify({ prompt: graph, client_id: context.operation }),
+            });
+            const id = text(response.prompt_id, "ComfyUI prompt_id");
+            const errors = object(response.node_errors ?? {}, "ComfyUI node_errors");
+            assert(Object.keys(errors).length === 0, `ComfyUI rejected workflow nodes: ${Object.keys(errors).join(", ")}`);
+            promptIds.push(id);
+          }
+        } catch (error) {
+          // A partial fan-out must not leave the already-queued prompts rendering unattended.
+          if (promptIds.length > 0) {
+            try { await client.deleteQueue(promptIds); } catch { /* best-effort: the orphaned prompts may still run */ }
+          }
+          throw error;
         }
         const handle: Handle = { contract: "hypit.comfyui-operation@1", promptIds, route: route.key, startedAt: Date.now() };
         const receipt = { id: promptIds[0] ?? "" };
@@ -340,7 +372,19 @@ function endpoint(client: ComfyUiClient, routes: readonly ComfyUiRoute[], pollIn
         for (const promptId of handle.promptIds) {
           const history = await client.json(`/history/${encodeURIComponent(promptId)}`);
           const entry = object(history[promptId] ?? {}, `ComfyUI history ${promptId}`);
-          if (Object.keys(entry).length === 0) continue;
+          if (Object.keys(entry).length === 0) {
+            // An empty history entry is normal while the prompt queues or runs. ComfyUI keeps
+            // history in process memory only, so a prompt absent from history AND the queue means
+            // the instance restarted; fail fast instead of spinning until operationTimeoutMs.
+            const queued = await client.queuePromptIds();
+            if (!queued.has(promptId)) {
+              const rechecked = await client.json(`/history/${encodeURIComponent(promptId)}`);
+              if (Object.keys(rechecked[promptId] ?? {}).length === 0) {
+                return { status: "failed", receipt, failure: { code: "COMFYUI_PROMPT_VANISHED", message: `ComfyUI no longer knows prompt ${promptId}: it is in neither history nor the queue, most likely because the instance restarted; the rendered result is lost` } };
+              }
+            }
+            continue;
+          }
           const status = object(entry.status ?? {}, `ComfyUI history ${promptId} status`);
           const rejected = comfyUiExecutionFailure(status, promptId);
           if (rejected !== undefined) return { ...failure(rejected), receipt };
@@ -355,19 +399,28 @@ function endpoint(client: ComfyUiClient, routes: readonly ComfyUiRoute[], pollIn
       }
     },
     async collect(context) {
+      let operationDeadlineAt: number | undefined;
       try {
         const handle = object(context.handle, "ComfyUI handle") as unknown as Handle;
         const route = routeFor(context.need.capability);
         assert(handle.contract === "hypit.comfyui-operation@1" && handle.route === route.key, "ComfyUI collection route differs");
+        const receipt = { id: handle.promptIds[0] ?? "" };
+        operationDeadlineAt = handle.startedAt + maxOperationMs;
+        if (Date.now() >= operationDeadlineAt) {
+          return { status: "failed", receipt, failure: { code: "COMFYUI_OPERATION_TIMEOUT", message: `Collecting the outputs of ComfyUI prompts ${handle.promptIds.join(", ")} exceeded this Provider's operationTimeoutMs (${maxOperationMs})` } };
+        }
         await context.reportProgress?.({ phase: "Receiving generated media" });
         const artifacts: BlobRef[] = [];
+        const mismatched: string[] = [];
+        const keys = route.result === "image" ? ["images"] : ["videos", "video", "gifs"];
+        const prefix = route.result === "image" ? "image/" : "video/";
         for (const promptId of handle.promptIds) {
           const history = await client.json(`/history/${encodeURIComponent(promptId)}`);
           const entry = object(history[promptId] ?? {}, `ComfyUI history ${promptId}`);
           const outputs = object(entry.outputs ?? {}, `ComfyUI history ${promptId} outputs`);
           for (const [nodeId, nodeOutput] of Object.entries(outputs)) {
             const files = object(nodeOutput, `ComfyUI output ${nodeId}`);
-            for (const key of ["images", "gifs", "videos", "video"]) {
+            for (const key of keys) {
               const list = files[key];
               if (!Array.isArray(list)) continue;
               for (const item of list) {
@@ -377,12 +430,20 @@ function endpoint(client: ComfyUiClient, routes: readonly ComfyUiRoute[], pollIn
                 const subfolder = typeof file.subfolder === "string" ? file.subfolder : "";
                 const path = `/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(subfolder)}&type=output`;
                 const downloaded = await client.download(path);
+                if (!downloaded.mediaType.startsWith(prefix)) {
+                  mismatched.push(`${filename} (${downloaded.mediaType})`);
+                  continue;
+                }
                 artifacts.push(await context.resources.put(downloaded.bytes, downloaded.mediaType));
               }
             }
           }
         }
-        assert(artifacts.length > 0, `ComfyUI produced no output files for prompts ${handle.promptIds.join(", ")}`);
+        if (artifacts.length === 0) {
+          throw new ComfyUiServiceError("COMFYUI_NO_OUTPUT", mismatched.length > 0
+            ? `ComfyUI produced no ${route.result} outputs for prompts ${handle.promptIds.join(", ")}; skipped ${mismatched.join(", ")} — point the workflow at a ${route.result}-producing output node`
+            : `ComfyUI produced no output files for prompts ${handle.promptIds.join(", ")}`);
+        }
         return {
           status: "completed",
           result: { value: {
@@ -394,7 +455,7 @@ function endpoint(client: ComfyUiClient, routes: readonly ComfyUiRoute[], pollIn
           receipt: { id: handle.promptIds[0] ?? "" },
         };
       } catch (error) {
-        return retrying(error, context.handle, pollIntervalMs) ?? failure(error);
+        return retrying(error, context.handle, pollIntervalMs, operationDeadlineAt) ?? failure(error);
       }
     },
   };
@@ -403,7 +464,8 @@ function endpoint(client: ComfyUiClient, routes: readonly ComfyUiRoute[], pollIn
 export function createComfyUiProvider(options: CreateComfyUiProviderOptions = {}) {
   const requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
   const operationTimeoutMs = options.operationTimeoutMs ?? 2 * 60 * 60_000;
-  for (const [name, value] of Object.entries({ requestTimeoutMs, operationTimeoutMs })) {
+  const pollIntervalMs = options.pollIntervalMs ?? 3_000;
+  for (const [name, value] of Object.entries({ requestTimeoutMs, operationTimeoutMs, pollIntervalMs })) {
     assert(Number.isSafeInteger(value) && value > 0, `ComfyUI ${name} must be a positive integer`);
   }
   let base = (options.baseUrl ?? "http://127.0.0.1:8188").trim();
@@ -411,7 +473,7 @@ export function createComfyUiProvider(options: CreateComfyUiProviderOptions = {}
   assert(base.length > 0, "ComfyUI base URL is empty");
   const client = new ComfyUiClient(base, requestTimeoutMs, options.fetch ?? globalThis.fetch);
   const routes = createComfyUiRoutes(options.workflows);
-  const asyncEndpoint = endpoint(client, routes, options.pollIntervalMs ?? 3_000, operationTimeoutMs);
+  const asyncEndpoint = endpoint(client, routes, pollIntervalMs, operationTimeoutMs);
   return defineEndpoint({
     instance: options.instance ?? "comfyui.default", pool: options.pool ?? options.instance ?? "comfyui.default",
     // Generation runs on the operator's own machine or rental; there is no Provider charge to read.

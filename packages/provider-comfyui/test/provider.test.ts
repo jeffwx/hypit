@@ -39,24 +39,44 @@ function registeredEndpoint(options: CreateComfyUiProviderOptions, capabilityNam
 
 /** Serve a scripted ComfyUI over one fake fetch; history moves once told to. */
 function fakeComfyUi(options: {
-  readonly output: { readonly key: "images" | "videos"; readonly filename: string };
-  state?: "pending" | "done" | "error";
+  readonly output: { readonly key: "images" | "videos" | "gifs"; readonly filename: string };
+  state?: "pending" | "done" | "error" | "vanished";
+  readonly uploadSubfolder?: string;
+  readonly failSecondSubmit?: boolean;
 }) {
   let state = options.state ?? "done";
   const submitted: Array<{ prompt: Record<string, { inputs: Record<string, unknown> }> }> = [];
+  const queueDeletes: Array<{ delete?: unknown }> = [];
+  const viewUrls: string[] = [];
+  let submissions = 0;
   const stored = new Map<string, Uint8Array>([[image.resource, png]]);
   let next = 0;
   const fetcher = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input));
     if (init?.method === "POST" && url.pathname === "/upload/image") {
-      return Response.json({ name: "hypit-ref.png", subfolder: "" });
+      return Response.json({ name: "hypit-ref.png", subfolder: options.uploadSubfolder ?? "" });
     }
     if (init?.method === "POST" && url.pathname === "/prompt") {
+      submissions += 1;
+      if (options.failSecondSubmit === true && submissions === 2) {
+        return new Response("gateway hiccup", { status: 502 });
+      }
       submitted.push(JSON.parse(String(init.body)));
-      return Response.json({ prompt_id: "p1", number: 1, node_errors: {} });
+      return Response.json({ prompt_id: "p1", number: submissions, node_errors: {} });
+    }
+    if (url.pathname === "/queue" && init?.method === "POST") {
+      queueDeletes.push(JSON.parse(String(init.body)));
+      return Response.json({});
+    }
+    if (url.pathname === "/queue") {
+      // While a prompt is still working it sits in the queue; "vanished" empties both queue and
+      // history, the state a restarted ComfyUI is in.
+      return Response.json(state === "pending"
+        ? { queue_running: [[1, "p1", {}, {}, []]], queue_pending: [] }
+        : { queue_running: [], queue_pending: [] });
     }
     if (url.pathname === "/history/p1") {
-      if (state === "pending") return Response.json({});
+      if (state === "pending" || state === "vanished") return Response.json({});
       if (state === "error") {
         return Response.json({ p1: { outputs: {}, status: { status_str: "error", completed: false,
           messages: [["execution_error", { node_type: "KSampler", node_id: "3", exception_message: "model not found" }]] } } });
@@ -66,6 +86,7 @@ function fakeComfyUi(options: {
       ] } }, status: { status_str: "success", completed: true, messages: [] } } });
     }
     if (url.pathname === "/view") {
+      viewUrls.push(`${url.pathname}${url.search}`);
       return new Response(options.output.key === "images" ? png : mp4, {
         headers: { "content-type": options.output.key === "images" ? "image/png" : "video/mp4" },
       });
@@ -80,7 +101,7 @@ function fakeComfyUi(options: {
       return { kind: "blob" as const, resource, size: bytes.byteLength, mediaType };
     },
   };
-  return { fetcher, submitted, resources, setState: (next: typeof state) => { state = next; } };
+  return { fetcher, submitted, queueDeletes, viewUrls, resources, setState: (next: typeof state) => { state = next; } };
 }
 
 function invocationContext(need: unknown, resources: unknown) {
@@ -108,8 +129,12 @@ test("image and video dimensions follow the Wan bands", () => {
   assert.deepEqual(imageDimensions("1K"), { width: 1024, height: 1024 });
   assert.deepEqual(videoDimensions("480p", "16:9"), { width: 832, height: 480 });
   assert.deepEqual(videoDimensions("480p", "9:16"), { width: 480, height: 832 });
+  assert.deepEqual(videoDimensions("480p", "1:1"), { width: 640, height: 640 });
   assert.deepEqual(videoDimensions("720p", "1:1"), { width: 960, height: 960 });
-  assert.equal(frameCount(5, 16), 80);
+  // Wan nodes quantize length onto a 4n+1 grid, rounded up: 5s × 16fps = 80 → 81 frames.
+  assert.equal(frameCount(5, 16), 81);
+  assert.equal(frameCount(2, 24), 49);
+  assert.equal(frameCount(1, 16), 17);
 });
 
 test("watermark and unconfigured video workflows are refused before submission", () => {
@@ -136,6 +161,86 @@ test("image-set is refused rather than degraded to independent seeds", () => {
   });
   assert.equal(verdict.status, "unsupported");
   assert.match(verdict.status === "unsupported" ? verdict.reason : "", /storyline/);
+});
+
+test("wan-2.7-image-pro has no bundled default and is refused until configured", () => {
+  const pro = route("@hypit/wan", "wan-2.7-image-pro");
+  const verdict = pro.supports({
+    capability: pro.capability, returns: pro.returns,
+    constraints: constraints(sealWanRequest("wan-2.7-image-pro", { prompt: ["a cat"] })),
+  });
+  assert.equal(verdict.status, "unsupported");
+  assert.match(verdict.status === "unsupported" ? verdict.reason : "", /no workflow configured/);
+});
+
+test("a vanished prompt fails fast instead of spinning to the operation timeout", async () => {
+  const fake = fakeComfyUi({ output: { key: "images", filename: "hypit_00001_.png" }, state: "vanished" });
+  const endpoint = registeredEndpoint({ ...imageInstance, fetch: fake.fetcher }, "wan-2.7-image");
+  const request = sealWanRequest("wan-2.7-image", { prompt: ["a red fox"] });
+  const need = { capability: { module: { name: "@hypit/wan", version: "1" }, name: "wan-2.7-image" }, constraints: constraints(request) };
+  const { base } = invocationContext(need, fake.resources);
+  const started = await endpoint.start({ ...base, operation: "op_v" }) as { handle: unknown };
+  const failed = await endpoint.poll({ ...base, operation: "op_v", handle: started.handle }) as {
+    status: string; failure: { code: string; message: string };
+  };
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.failure.code, "COMFYUI_PROMPT_VANISHED");
+  assert.match(failed.failure.message, /neither history nor the queue/);
+});
+
+test("a partial fan-out failure clears the prompts already queued", async () => {
+  const fake = fakeComfyUi({ output: { key: "images", filename: "hypit_00001_.png" }, failSecondSubmit: true });
+  const endpoint = registeredEndpoint({ ...imageInstance, fetch: fake.fetcher }, "wan-2.7-image");
+  const request = sealWanRequest("wan-2.7-image", { prompt: ["cats"], count: [2], seed: [100] });
+  const need = { capability: { module: { name: "@hypit/wan", version: "1" }, name: "wan-2.7-image" }, constraints: constraints(request) };
+  const { base } = invocationContext(need, fake.resources);
+  const started = await endpoint.start({ ...base, operation: "op_c" }) as { status: string; failure?: { code: string } };
+  assert.equal(started.status, "failed");
+  assert.equal(started.failure?.code, "COMFYUI_HTTP_ERROR");
+  assert.deepEqual(fake.queueDeletes, [{ delete: ["p1"] }]);
+});
+
+test("collect skips output files of the wrong media kind and fails naming them", async () => {
+  const fake = fakeComfyUi({ output: { key: "gifs", filename: "hypit_00001_.gif" } });
+  const spec: ComfyUiWorkflowSpec = {
+    template: fileURLToPath(new URL("./fixtures/video.json", import.meta.url)),
+    nodes: { prompt: "2.text", seed: "3.seed", width: "1.width", height: "1.height", frames: "1.length", firstFrame: "5.image" },
+    fps: 16,
+  };
+  const endpoint = registeredEndpoint({ ...imageInstance, fetch: fake.fetcher, workflows: { "wan-2.2-video": spec } }, "wan-2.2-video");
+  const request = sealWanVideoRequest("wan-2.2-video", { prompt: ["a fox runs"], seconds: [5], resolution: ["480p"], aspectRatio: ["16:9"] });
+  const need = { capability: { module: { name: "@local/wan-video", version: "1" }, name: "wan-2.2-video" }, constraints: constraints(request) };
+  const { base } = invocationContext(need, fake.resources);
+  const started = await endpoint.start({ ...base, operation: "op_g" }) as { handle: unknown };
+  assert.equal((await endpoint.poll({ ...base, operation: "op_g", handle: started.handle }) as { status: string }).status, "ready");
+  const collected = await endpoint.collect({ ...base, operation: "op_g", handle: started.handle }) as {
+    status: string; failure?: { code: string; message: string };
+  };
+  assert.equal(collected.status, "failed");
+  assert.equal(collected.failure?.code, "COMFYUI_NO_OUTPUT");
+  assert.match(collected.failure?.message ?? "", /hypit_00001_\.gif \(image\/gif\)/);
+});
+
+test("uploads in a subfolder address the LoadImage node as subfolder/name", async () => {
+  const fake = fakeComfyUi({ output: { key: "videos", filename: "shot_00001.mp4" }, uploadSubfolder: "refs" });
+  const spec: ComfyUiWorkflowSpec = {
+    template: fileURLToPath(new URL("./fixtures/video.json", import.meta.url)),
+    nodes: { prompt: "2.text", seed: "3.seed", width: "1.width", height: "1.height", frames: "1.length", firstFrame: "5.image" },
+    fps: 16,
+  };
+  const endpoint = registeredEndpoint({ ...imageInstance, fetch: fake.fetcher, workflows: { "wan-2.2-video": spec } }, "wan-2.2-video");
+  const request = sealWanVideoRequest("wan-2.2-video", {
+    prompt: ["a fox runs"], firstFrame: [{ role: "image", artifact: image }],
+    seconds: [5], resolution: ["480p"], aspectRatio: ["16:9"], seed: [11],
+  });
+  const need = { capability: { module: { name: "@local/wan-video", version: "1" }, name: "wan-2.2-video" }, constraints: constraints(request) };
+  const { base } = invocationContext(need, fake.resources);
+  const started = await endpoint.start({ ...base, operation: "op_s" }) as { handle: unknown };
+  assert.equal(fake.submitted[0]!.prompt["5"]!.inputs.image, "refs/hypit-ref.png");
+  assert.equal((await endpoint.poll({ ...base, operation: "op_s", handle: started.handle }) as { status: string }).status, "ready");
+  await endpoint.collect({ ...base, operation: "op_s", handle: started.handle });
+  assert.ok(fake.viewUrls[0]?.includes("filename=shot_00001.mp4") && fake.viewUrls[0]?.includes("type=output"),
+    `view url carries the output query parameters: ${fake.viewUrls[0] ?? "none"}`);
 });
 
 test("an image request runs the built-in template through submit, poll and collect", async () => {
@@ -185,7 +290,7 @@ test("a video request uploads its keyframe and sets frames from seconds", async 
   const submitted = fake.submitted[0]!;
   assert.equal(submitted.prompt["2"]!.inputs.text, "a fox runs");
   assert.equal(submitted.prompt["5"]!.inputs.image, "hypit-ref.png");
-  assert.equal(submitted.prompt["1"]!.inputs.length, 80);
+  assert.equal(submitted.prompt["1"]!.inputs.length, 81);
   assert.equal(submitted.prompt["1"]!.inputs.width, 832);
   assert.equal(submitted.prompt["1"]!.inputs.height, 480);
   assert.equal(submitted.prompt["3"]!.inputs.seed, 11);

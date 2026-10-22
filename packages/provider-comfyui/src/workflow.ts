@@ -13,7 +13,6 @@ export type WorkflowGraph = Readonly<Record<string, {
 /** Which workflow inputs receive which generated-request values. */
 export type ComfyUiNodeMap = {
   readonly prompt: string;
-  readonly negative?: string;
   readonly seed: string;
   readonly width?: string;
   readonly height?: string;
@@ -78,7 +77,11 @@ export async function loadWorkflowTemplate(path: string): Promise<WorkflowGraph>
 }
 
 export function workflowNodeIds(graph: WorkflowGraph): readonly string[] {
-  return Object.keys(graph).sort((left, right) => Number(left) - Number(right));
+  return Object.keys(graph).sort((left, right) => {
+    const a = Number(left);
+    const b = Number(right);
+    return Number.isFinite(a) && Number.isFinite(b) ? a - b : left.localeCompare(right);
+  });
 }
 
 /** Resolve and write one `nodeId.inputName` slot. Returns the written copy, leaving the template intact. */
@@ -97,7 +100,7 @@ export function setWorkflowInput(graph: WorkflowGraph, ref: string, value: strin
 export function validateNodeMap(graph: WorkflowGraph, nodes: ComfyUiNodeMap, subject: string): void {
   const available = `available node ids: ${workflowNodeIds(graph).join(", ")}`;
   const refs = [
-    nodes.prompt, nodes.seed, nodes.negative, nodes.width, nodes.height,
+    nodes.prompt, nodes.seed, nodes.width, nodes.height,
     nodes.image, nodes.firstFrame, nodes.lastFrame, nodes.frames,
   ];
   for (const ref of refs) {
@@ -122,7 +125,7 @@ export function imageDimensions(band: string): { readonly width: number; readonl
 
 /** The dimension pairs Wan workflows conventionally use per band and aspect. */
 const VIDEO_DIMENSIONS: Readonly<Record<string, Readonly<Record<string, { width: number; height: number }>>>> = {
-  "480p": { "16:9": { width: 832, height: 480 }, "9:16": { width: 480, height: 832 }, "1:1": { width: 608, height: 608 } },
+  "480p": { "16:9": { width: 832, height: 480 }, "9:16": { width: 480, height: 832 }, "1:1": { width: 640, height: 640 } },
   "720p": { "16:9": { width: 1280, height: 720 }, "9:16": { width: 720, height: 1280 }, "1:1": { width: 960, height: 960 } },
   "1080p": { "16:9": { width: 1920, height: 1080 }, "9:16": { width: 1080, height: 1920 }, "1:1": { width: 1440, height: 1440 } },
 };
@@ -137,5 +140,8 @@ export function videoDimensions(band: string, aspect: string): { readonly width:
 
 export function frameCount(seconds: number, fps: number): number {
   assert(Number.isSafeInteger(fps) && fps > 0, "Video fps must be a positive integer");
-  return Math.max(1, Math.round(seconds * fps));
+  const raw = Math.max(1, Math.round(seconds * fps));
+  // Wan-family video nodes quantize length onto a 4n+1 frame grid; round up so the rendered clip
+  // is never shorter than the requested seconds.
+  return 4 * Math.max(1, Math.ceil((raw - 1) / 4)) + 1;
 }
